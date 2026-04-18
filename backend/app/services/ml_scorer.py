@@ -672,6 +672,21 @@ class IndustryATSScorer:
         print("\n[Validation 2/2]  Temporal Recency …")
         temp_s  = _score_temporal(query_skills, texts)
 
+        W = WEIGHTS
+        ensemble = (
+            W["bge"]           * bge_s
+            + W["minilm"]      * mini_s
+            + W["cross_encoder"] * cross_s
+            + W["bm25"]        * bm25_s
+            + W["ner_skills"]  * ner_s
+            + W["temporal"]    * temp_s
+        )
+
+        print(f"\n[Pre-filter]  Checking ≥ {min_years_exp} years of experience …")
+        multipliers = _hard_filter_multipliers(df, min_years_exp)
+        # Apply experience multiplier to the ensemble before calibration
+        ensemble = ensemble * multipliers
+
         calibrated = np.zeros(len(texts))
 
         # ── Calibrate ─────────────────────────────────────────────────────
