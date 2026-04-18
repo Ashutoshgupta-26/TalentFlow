@@ -1,0 +1,25 @@
+# Node modules
+node_modules/
+dist/
+
+# Python virtual environments
+.venv/
+__pycache__/
+*.pyc
+
+# Environment variables
+backend/.env
+
+# Firebase admin SDK key (sensitive)
+ats-project-f2192-firebase-adminsdk-fbsvc-cc381d76ec.json
+
+# Uploads
+backend/uploads/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
