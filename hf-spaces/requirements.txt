@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+scikit-learn
+sentence-transformers
+rank-bm25
+spacy
+pydantic
