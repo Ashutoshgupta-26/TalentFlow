@@ -1,45 +1,23 @@
 
 # --- CELL 1 ---
 """
-Industry-Grade Ensemble ATS Scorer  (Bug-Fix Release)
-======================================================
-Fixes applied vs. previous version:
+Industry-Grade Ensemble ATS Scorer  (Accuracy Release v2)
+=========================================================
+Key architecture change: NER Skill Overlap is now the PRIMARY discriminator
+at 60% weight. Semantic embeddings (BGE/MiniLM) are de-weighted to 2.5% each
+because cosine similarity between ANY English text chunks is ~0.3-0.5,
+making them unable to distinguish a finance resume from an SDE resume.
 
-  BUG 1 — NER Skill Overlap always 0
-    Cause : EntityRuler used plain lowercase string patterns, which spaCy
-            matches case-sensitively at the token level. "Python" in a resume
-            never matched the pattern "python".
-    Fix   : Every pattern now uses the token-level dict format
-            [{"LOWER": token}, …] which is case-insensitive by design.
-
-  BUG 2 — Temporal Recency always 0
-    Cause : Most ATS CSV datasets don't embed "2019–2022" date ranges inside
-            free-text skill descriptions. When no year is found near a skill,
-            the old code returned 0 — penalising candidates unfairly.
-    Fix   : When no date context is found for a skill the score is 50.0
-            (neutral / unknown) not 0. Only *confirmed* stale skills are
-            penalised. Also detects "X years of experience" phrases as a
-            proxy for recency.
-
-  BUG 3 — Experience Multiplier always 0.50 (penalised)
-    Cause : Regex r"(\\d{1,2})\\+?\\s*(?:years?|yrs?)" missed common formats
-            such as "Experience: 5", "total experience 8 years", or a numeric
-            CSV column named 'years_experience' / 'experience'.
-    Fix   : (a) Broader regex covering more natural-language patterns.
-            (b) Direct numeric-column scan of the original CSV row.
-            (c) When no experience data is found at all, use 0.75 (soft
-                neutral) instead of the full 0.50 penalty.
-
-Scoring Architecture (unchanged)
+Scoring Architecture
 ─────────────────────────────────────────────────────────────────────
-BUCKET          SIGNALS                         BUCKET WT  SIGNAL WT
-──────────────  ──────────────────────────────  ─────────  ─────────
-Semantic        BGE Bi-Encoder                    45 %       22.5 %
-                MiniLM Bi-Encoder                            22.5 %
-Precision       Cross-Encoder (DL, sigmoid)       45 %       25.0 %
-                BM25 Okapi                                   20.0 %
-Validation      NER Skill Overlap                 10 %        6.0 %
-                Temporal Recency                              4.0 %
+SIGNAL                              WEIGHT
+──────────────────────────────────  ──────
+NER Skill Overlap (canonical)       60 %   ← PRIMARY DISCRIMINATOR
+BM25 Keyword Retrieval              15 %
+Cross-Encoder (sigmoid scaled)      10 %
+Temporal Recency                    10 %
+BGE Bi-Encoder                       2.5%
+MiniLM Bi-Encoder                    2.5%
 
 Pre-filter multiplier (applied after ensemble):
   years found >= required  →  × 1.00
@@ -80,19 +58,48 @@ HARD_FILTER_PENALTY  = 0.50   # multiplier when years < required
 SOFT_NEUTRAL_MULT    = 0.75   # multiplier when years can't be determined
 
 WEIGHTS = {
-    "bge":           0.225,
-    "minilm":        0.225,
-    "cross_encoder": 0.250,
-    "bm25":          0.200,
-    "ner_skills":    0.060,
-    "temporal":      0.040,
+    "bge":           0.025,   #  2.5% semantic (very noisy — same score for any text)
+    "minilm":        0.025,   #  2.5% semantic
+    "cross_encoder": 0.100,   # 10%  precision context (passage retrieval, not skill matcher)
+    "bm25":          0.150,   # 15%  keyword retrieval
+    "ner_skills":    0.600,   # 60%  hard skill overlap  ← THE DISCRIMINATOR
+    "temporal":      0.100,   # 10%  recency / experience proxy
 }
 assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SKILL SYNONYM TABLE
+#  SCORE CALIBRATION
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _calibrate_single(raw_ensemble: float, skill_ratio: float, exp_mult: float) -> float:
+    """
+    Absolute score for a SINGLE candidate (web-app mode).
+
+    The raw_ensemble is now dominated by skill overlap (60% weight), so it
+    already encodes strong domain discrimination.  We blend it with an
+    experience modifier to produce the final score.
+    """
+    # Experience score
+    if exp_mult >= 1.0:
+        exp_score = 90.0
+    elif exp_mult >= 0.75:
+        exp_score = 55.0
+    else:
+        exp_score = 25.0
+
+    # If the candidate has 0 relevant skills, their experience in another field shouldn't boost them.
+    if skill_ratio == 0:
+        exp_score = 0.0
+        final = raw_ensemble * 0.5  # Heavy penalty for zero skill overlap
+    else:
+        if skill_ratio < 0.3:
+            exp_score *= 0.3  # Scale down experience if skills are severely lacking
+
+        # Blend: 75% ensemble + 25% experience context
+        final = 0.75 * raw_ensemble + 0.25 * exp_score
+
+    return round(max(5.0, min(98.0, final)), 2)
 
 SKILL_SYNONYMS: dict[str, list[str]] = {
     "python":                      ["py"],
@@ -148,6 +155,10 @@ _ALIAS_TO_CANONICAL: dict[str, str] = {
     for alias in aliases
 }
 
+# Also add self-mappings so canonical names map to themselves
+for canonical in SKILL_SYNONYMS:
+    _ALIAS_TO_CANONICAL[canonical] = canonical
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  NER PIPELINE  (FIX 1 — case-insensitive token patterns)
@@ -183,11 +194,28 @@ def _build_ner_pipeline():
 
 
 def _extract_ner_skills(nlp, text: str) -> set:
+    """
+    Extract skills from text and map them to CANONICAL forms.
+    This ensures 'js' in a resume matches 'javascript' in the query,
+    'react.js' matches 'react', 'aws' matches 'amazon web services', etc.
+    """
     doc = nlp(text[:50_000])
-    return {ent.text.lower() for ent in doc.ents if ent.label_ == "TECH_SKILL"}
+    skills = set()
+    for ent in doc.ents:
+        if ent.label_ == "TECH_SKILL":
+            surface = ent.text.lower()
+            # Map to canonical form — 'js' → 'javascript', 'aws' → 'amazon web services'
+            canonical = _ALIAS_TO_CANONICAL.get(surface, surface)
+            skills.add(canonical)
+    return skills
 
 
 def _score_ner_skills(nlp, query_skills: set, texts: list) -> np.ndarray:
+    """
+    Score each resume by fraction of required skills found.
+    Both query_skills and resume skills are in CANONICAL form,
+    so 'js' in resume correctly matches 'javascript' in query.
+    """
     if not query_skills:
         return np.full(len(texts), 50.0)
     scores = []
@@ -525,7 +553,7 @@ class IndustryATSScorer:
         print("  [4/4] spaCy NER pipeline (case-insensitive patterns) …")
         self.nlp = _build_ner_pipeline()
 
-        print("\n  ✅  All components ready.\n")
+        print("\n  Success:  All components ready.\n")
 
     def load_and_prep_candidates(
         self, uri: str = "mongodb://localhost:27017", limit: int = None
@@ -571,16 +599,24 @@ class IndustryATSScorer:
         print(f"Prepared {len(df)} profiles.  Experience columns detected: {exp_cols or 'none — will use regex'}\n")
         return df
     def _score_bge(self, query, texts):
+        """BGE semantic similarity — raw cosine * 100, NO 2x inflation."""
         q = self.bge.encode(query)
         r = self.bge.encode(texts, show_progress_bar=True)
-        return np.maximum(0.0, cosine_similarity([q], r)[0] * 100)
+        raw = cosine_similarity([q], r)[0] * 100
+        return np.clip(raw, 0.0, 100.0)
 
     def _score_minilm(self, query, texts):
+        """MiniLM semantic similarity — raw cosine * 100, NO 2x inflation."""
         q = self.minilm.encode(query)
         r = self.minilm.encode(texts, show_progress_bar=True)
-        return np.maximum(0.0, cosine_similarity([q], r)[0] * 100)
+        raw = cosine_similarity([q], r)[0] * 100
+        return np.clip(raw, 0.0, 100.0)
 
     def _score_cross_encoder(self, query, texts):
+        """
+        Cross-encoder scoring with sigmoid scaling to [0, 100].
+        NO artificial floor — irrelevant text should score near 0.
+        """
         pairs  = [(query, t) for t in texts]
         logits = self.cross.predict(
             pairs, batch_size=32, show_progress_bar=True, convert_to_numpy=True
@@ -588,9 +624,17 @@ class IndustryATSScorer:
         return _sigmoid_scale(logits)
 
     def _score_bm25(self, query, texts):
+        """
+        BM25 keyword retrieval.
+        For single candidates: use sigmoid-based absolute scoring instead of
+        _normalise which always returns 50.0 when there's only one candidate.
+        """
         tokenised = [_tokenise(t) for t in texts]
         bm25      = BM25Okapi(tokenised, k1=1.5, b=0.75)
         raw       = np.array(bm25.get_scores(_tokenise(query)), dtype=float)
+        if len(texts) <= 2:
+            # Absolute scoring: sigmoid maps raw BM25 to [0, 100]
+            return np.round(np.clip(100.0 / (1.0 + np.exp(-0.1 * (raw - 15))), 0, 100), 2)
         return _normalise(raw)
 
     def find_top_candidates(
@@ -628,19 +672,24 @@ class IndustryATSScorer:
         print("\n[Validation 2/2]  Temporal Recency …")
         temp_s  = _score_temporal(query_skills, texts)
 
-        W        = WEIGHTS
-        ensemble = (
-            W["bge"]           * bge_s
-            + W["minilm"]      * mini_s
-            + W["cross_encoder"] * cross_s
-            + W["bm25"]        * bm25_s
-            + W["ner_skills"]  * ner_s
-            + W["temporal"]    * temp_s
-        )
+        calibrated = np.zeros(len(texts))
 
-        print(f"\n[Pre-filter]  Checking ≥ {min_years_exp} years of experience …")
-        multipliers = _hard_filter_multipliers(df, min_years_exp)
-        ensemble    = ensemble * multipliers
+        # ── Calibrate ─────────────────────────────────────────────────────
+        if len(texts) >= 3:
+            # Pool mode: raw ensemble is used (already normalized/weighted)
+            calibrated = ensemble
+        else:
+            # Single-candidate mode (web app): absolute scoring using
+            # skill overlap as the primary discriminator (60% weight in ensemble)
+            for i in range(len(texts)):
+                if query_skills:
+                    resume_skills = _extract_ner_skills(self.nlp, texts[i])
+                    skill_ratio = len(query_skills & resume_skills) / len(query_skills)
+                else:
+                    skill_ratio = 0.5   # no skills to check → neutral
+                calibrated[i] = _calibrate_single(
+                    ensemble[i], skill_ratio, multipliers[i]
+                )
 
         df = df.copy()
         df["score_bge"]           = np.round(bge_s,    2)
@@ -650,7 +699,7 @@ class IndustryATSScorer:
         df["score_ner_skills"]    = np.round(ner_s,    2)
         df["score_temporal"]      = np.round(temp_s,   2)
         df["exp_multiplier"]      = np.round(multipliers, 2)
-        df["match_score"]         = np.round(ensemble, 2)
+        df["match_score"]         = np.round(calibrated, 2)
 
         return df.sort_values("match_score", ascending=False)
 
@@ -667,12 +716,12 @@ SCORE_COLS = [
 _EXP_COL_NAMES = ["years_of_experience", "experience", "total_experience", "yrs_exp", "experience_years"]
 
 SIGNAL_LABELS = {
-    "score_bge":           f"BGE Bi-Encoder         ({int(WEIGHTS['bge']*100)}%)",
-    "score_minilm":        f"MiniLM Bi-Encoder      ({int(WEIGHTS['minilm']*100)}%)",
-    "score_cross_encoder": f"Cross-Encoder [DL]     ({int(WEIGHTS['cross_encoder']*100)}%)",
-    "score_bm25":          f"BM25 Retrieval         ({int(WEIGHTS['bm25']*100)}%)",
-    "score_ner_skills":    f"NER Skill Overlap      ({int(WEIGHTS['ner_skills']*100)}%)",
-    "score_temporal":      f"Temporal Recency       ({int(WEIGHTS['temporal']*100)}%)",
+    "score_bge":           f"BGE Bi-Encoder         ({WEIGHTS['bge']*100:.4g}%)",
+    "score_minilm":        f"MiniLM Bi-Encoder      ({WEIGHTS['minilm']*100:.4g}%)",
+    "score_cross_encoder": f"Cross-Encoder [DL]     ({WEIGHTS['cross_encoder']*100:.4g}%)",
+    "score_bm25":          f"BM25 Retrieval         ({WEIGHTS['bm25']*100:.4g}%)",
+    "score_ner_skills":    f"NER Skill Overlap      ({WEIGHTS['ner_skills']*100:.4g}%)",
+    "score_temporal":      f"Temporal Recency       ({WEIGHTS['temporal']*100:.4g}%)",
     "exp_multiplier":      "Experience Multiplier  (pre-filter)",
     "match_score":         "FINAL SCORE",
 }
@@ -774,8 +823,6 @@ def score_single_application(job_details: dict, candidate_resume: dict, candidat
     from app.database import get_collection
     import pandas as pd
     
-    scorer = get_ml_pipeline()
-    
     required_skills = job_details.get("required_skills", []) or []
     recruiter_query = (
         f"Title: {job_details.get('title', '')}\n"
@@ -805,6 +852,14 @@ def score_single_application(job_details: dict, candidate_resume: dict, candidat
         lambda row: "\n".join(f"{c}: {v}" for c, v in row.items()), axis=1
     )
     
+    # 🚨 BLANK PDF INTERCEPTOR:
+    # If the total parsed text from skills, education, and experience is essentially empty,
+    # block the AI and immediately return 0. Sentence embeddings for empty strings natively 
+    # sit near the vector origin which mathematically generates a ~20% "baseline" similarity!
+    total_resume_content = (resume_skills + edu_str + exp_str).strip()
+    if len(total_resume_content) < 10:
+        return 0
+    
     from app.config import HF_SPACES_URL
     import requests
 
@@ -824,15 +879,25 @@ def score_single_application(job_details: dict, candidate_resume: dict, candidat
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get("match_score", 0)
+            else:
+                print("HF Space returned error:", resp.text)
         except Exception as e:
-            print("HF ML Scorer Error:", e)
+            print("HF ML Scorer Error (Is the Space still building?):", e)
+            
+        # VERY IMPORTANT: If the cloud is still building or failed, 
+        # do NOT fallback to the exact local AI load because it freezes the PC!
+        # Fallback to the ultra-fast secondary string matching instead!
+        user_skills = [s.lower() for s in (candidate_resume.get("skills", []) or [])]
+        required_lower = [s.lower() for s in required_skills]
+        matching = [s for s in required_lower if s in user_skills]
+        return round(len(matching) / len(required_lower) * 100) if required_lower else 0
 
+    # (Original Local ML Logic if HF_SPACES_URL is not set at all)
     try:
         scorer = get_ml_pipeline()
         scored_df = scorer.find_top_candidates(recruiter_query, df, top_n=1)
         if not scored_df.empty:
             score = float(scored_df.iloc[0]["match_score"])
-            # Clamp between 0 and 100
             return max(0, min(100, int(score)))
     except Exception as e:
         print("ML Scorer Error:", e)

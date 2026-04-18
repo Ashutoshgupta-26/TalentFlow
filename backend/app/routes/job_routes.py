@@ -61,37 +61,32 @@ def get_jobs_by_recruiter(recruiter_id: int):
 
 @router.get("/matches/{user_id}", response_model=list[JobMatchOut])
 def get_job_matches(user_id: int):
-    """Compute skill-match percentage between user's resume and all active jobs."""
+    """Compute skill-match percentage between user's resume and all active jobs using ML Scorer."""
     resumes = get_collection("resumes")
     jobs_collection = get_collection("jobs")
+    users = get_collection("users")
 
-    resume = resumes.find_one({"user_id": user_id}, {"_id": 0, "skills": 1})
+    resume = resumes.find_one({"user_id": user_id}, {"_id": 0})
     if not resume:
         return []
 
-    user_skills = [s.lower() for s in (resume.get("skills") or [])]
+    user = users.find_one({"id": user_id}, {"_id": 0}) or {}
     jobs = list(jobs_collection.find({"status": "active"}, {"_id": 0}).sort("created_at", DESCENDING))
+
+    from app.services.ml_scorer import score_single_application
 
     results = []
     for job_row in jobs:
-        required = job_row["required_skills"] or []
-        required_lower = [s.lower() for s in required]
-
-        matching = [s for s in required_lower if s in user_skills]
-        missing = [s for s in required_lower if s not in user_skills]
-
-        pct = round(len(matching) / len(required) * 100) if required else 0
-
-        # Map back to original casing
-        matching_original = [required[i] for i, s in enumerate(required_lower) if s in user_skills]
-        missing_original = [required[i] for i, s in enumerate(required_lower) if s not in user_skills]
+        required = job_row.get("required_skills") or []
+        
+        pct = score_single_application(job_row, resume, user)
 
         results.append(
             JobMatchOut(
                 job=_row_to_job(job_row),
                 matchPercentage=pct,
-                matchingSkills=matching_original,
-                missingSkills=missing_original,
+                matchingSkills=[],
+                missingSkills=[],
             )
         )
 

@@ -37,7 +37,7 @@ except ImportError:
 
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
-from ml_engine import IndustryATSScorer
+from ml_engine import RecruiterATSScorer as IndustryATSScorer
 
 
 # ════════════════════════════════════════════════════════════════
@@ -127,17 +127,16 @@ def score_candidate(req: ScoreRequest):
     )
 
     try:
-        scored_df = scorer.find_top_candidates(recruiter_query, df, top_n=1)
+        try:
+            exp_int = int(req.experience_level)
+        except (ValueError, TypeError):
+            exp_int = 0
+            
+        scored_df = scorer.find_top_candidates(recruiter_query=recruiter_query, df=df, min_years_exp=exp_int, top_n=1)
         if not scored_df.empty:
             score = float(scored_df.iloc[0]["match_score"])
-            score = max(0, min(100, int(score)))
-            
-            details = {}
-            for col in scored_df.columns:
-                if col.startswith("score_") or col in ["exp_multiplier", "match_score"]:
-                    details[col] = round(float(scored_df.iloc[0][col]), 2)
-            
-            return ScoreResponse(match_score=score, details=details)
+            score = max(0, min(100, int(round(score))))
+            return ScoreResponse(match_score=score, details={"match_score": score})
     except Exception as e:
         print(f"ML Scorer Error: {e}")
 
