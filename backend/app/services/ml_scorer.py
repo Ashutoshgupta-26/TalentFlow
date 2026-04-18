@@ -805,7 +805,30 @@ def score_single_application(job_details: dict, candidate_resume: dict, candidat
         lambda row: "\n".join(f"{c}: {v}" for c, v in row.items()), axis=1
     )
     
+    from app.config import HF_SPACES_URL
+    import requests
+
+    if HF_SPACES_URL:
+        try:
+            payload = {
+                "job_title": job_details.get("title", ""),
+                "job_description": job_details.get("description", ""),
+                "required_skills": required_skills,
+                "experience_level": str(job_details.get("experience_level", "0")),
+                "candidate_skills": resume_skills,
+                "candidate_education": edu_str,
+                "candidate_experience": exp_str,
+                "candidate_role": candidate_user.get("role", "candidate")
+            }
+            resp = requests.post(f"{HF_SPACES_URL.rstrip('/')}/score", json=payload, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("match_score", 0)
+        except Exception as e:
+            print("HF ML Scorer Error:", e)
+
     try:
+        scorer = get_ml_pipeline()
         scored_df = scorer.find_top_candidates(recruiter_query, df, top_n=1)
         if not scored_df.empty:
             score = float(scored_df.iloc[0]["match_score"])
